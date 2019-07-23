@@ -82,3 +82,4 @@ frame_host_manager.patch
 crashpad_pid_check.patch
 chore_add_debounce_on_the_updatewebcontentsvisibility_method_to.patch
 fix_use_weakptr_to_detect_deletion.patch
+backport_crashpad_cpu_context_capture.patch
