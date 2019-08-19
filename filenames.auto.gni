@@ -257,6 +257,7 @@ auto_filenames = {
     "lib/browser/ipc-main-internal.ts",
     "lib/browser/navigation-controller.js",
     "lib/browser/objects-registry.js",
+    "lib/browser/remote.js",
     "lib/browser/rpc-server.js",
     "lib/browser/utils.ts",
     "lib/common/api/clipboard.js",
