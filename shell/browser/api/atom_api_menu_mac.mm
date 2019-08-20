@@ -9,6 +9,7 @@
 
 #include "base/mac/scoped_sending_event.h"
 #include "base/message_loop/message_loop.h"
+#include "base/message_loop/message_loop_current.h"
 #include "base/strings/sys_string_conversions.h"
 #include "base/task/post_task.h"
 #include "content/public/browser/browser_task_traits.h"
