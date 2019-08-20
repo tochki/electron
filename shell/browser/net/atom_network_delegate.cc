@@ -14,6 +14,7 @@
 #include "content/public/browser/browser_task_traits.h"
 #include "content/public/browser/browser_thread.h"
 #include "content/public/browser/render_frame_host.h"
+#include "content/public/browser/resource_request_info.h"
 #include "net/base/load_flags.h"
 #include "net/base/net_errors.h"
 #include "net/url_request/url_request.h"
@@ -99,13 +100,13 @@ void ToDictionary(base::DictionaryValue* details, net::URLRequest* request) {
   FillRequestDetails(details, request);
   details->SetInteger("id", request->identifier());
   details->SetDouble("timestamp", base::Time::Now().ToDoubleT() * 1000);
-  // auto* info = content::ResourceRequestInfo::ForRequest(request);
-  // if (info) {
-  //   details->SetString("resourceType",
-  //                      ResourceTypeToString(info->GetResourceType()));
-  // } else {
-  //   details->SetString("resourceType", "other");
-  // }
+  auto* info = content::ResourceRequestInfo::ForRequest(request);
+  if (info) {
+    details->SetString("resourceType",
+                       ResourceTypeToString(info->GetResourceType()));
+  } else {
+    details->SetString("resourceType", "other");
+  }
 }
 
 void ToDictionary(base::DictionaryValue* details,
@@ -384,15 +385,15 @@ net::NetworkDelegate::AuthRequiredResponse AtomNetworkDelegate::OnAuthRequired(
     const net::AuthChallengeInfo& auth_info,
     AuthCallback callback,
     net::AuthCredentials* credentials) {
-  // auto* resource_request_info =
-  //     content::ResourceRequestInfo::ForRequest(request);
-  // if (!resource_request_info)
-  return AUTH_REQUIRED_RESPONSE_NO_ACTION;
-  // login_handler_map_.emplace(
-  //     request->identifier(),
-  //     new LoginHandler(request, auth_info, std::move(callback), credentials,
-  //                      resource_request_info));
-  // return AUTH_REQUIRED_RESPONSE_IO_PENDING;
+  auto* resource_request_info =
+      content::ResourceRequestInfo::ForRequest(request);
+  if (!resource_request_info)
+    return AUTH_REQUIRED_RESPONSE_NO_ACTION;
+  login_handler_map_.emplace(
+      request->identifier(),
+      new LoginHandler(request, auth_info, std::move(callback), credentials,
+                       resource_request_info));
+  return AUTH_REQUIRED_RESPONSE_IO_PENDING;
 }
 
 bool AtomNetworkDelegate::OnCanGetCookies(const net::URLRequest& request,
@@ -475,8 +476,8 @@ int AtomNetworkDelegate::HandleResponseEvent(
   FillDetailsObject(details.get(), request, args...);
 
   int render_process_id, render_frame_id;
-  // content::ResourceRequestInfo::GetRenderFrameForRequest(
-  //     request, &render_process_id, &render_frame_id);
+  content::ResourceRequestInfo::GetRenderFrameForRequest(
+      request, &render_process_id, &render_frame_id);
 
   // The |request| could be destroyed before the |callback| is called.
   callbacks_[request->identifier()] = std::move(callback);
@@ -503,8 +504,8 @@ void AtomNetworkDelegate::HandleSimpleEvent(SimpleEvent type,
   FillDetailsObject(details.get(), request, args...);
 
   int render_process_id, render_frame_id;
-  // content::ResourceRequestInfo::GetRenderFrameForRequest(
-  //     request, &render_process_id, &render_frame_id);
+  content::ResourceRequestInfo::GetRenderFrameForRequest(
+      request, &render_process_id, &render_frame_id);
 
   base::PostTaskWithTraits(
       FROM_HERE, {BrowserThread::UI},

@@ -1,0 +1,1650 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Samuel Attard <sattard@slack-corp.com>
+Date: Tue, 20 Aug 2019 14:40:19 -0700
+Subject: Revert "Remove ResourceRequestInfo."
+
+This reverts commit 346c99158a1ea8b52d4837dac679693289e5a308.
+
+diff --git a/android_webview/browser/aw_cookie_access_policy.cc b/android_webview/browser/aw_cookie_access_policy.cc
+index b753bde837c3c64031af306f87bacdba516f38f2..459895f1d1faf8755fb9b9555c6a907d17448516 100644
+--- a/android_webview/browser/aw_cookie_access_policy.cc
++++ b/android_webview/browser/aw_cookie_access_policy.cc
+@@ -7,16 +7,21 @@
+ #include <memory>
+ 
+ #include "android_webview/browser/aw_contents_io_thread_client.h"
++#include "base/feature_list.h"
+ #include "base/logging.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/resource_request_info.h"
+ #include "content/public/browser/websocket_handshake_request_info.h"
+ #include "net/base/net_errors.h"
+ #include "net/base/static_cookie_policy.h"
++#include "net/url_request/url_request.h"
++#include "services/network/public/cpp/features.h"
+ #include "url/gurl.h"
+ 
+ using base::AutoLock;
+ using content::BrowserThread;
++using content::ResourceRequestInfo;
+ using content::WebSocketHandshakeRequestInfo;
+ 
+ namespace android_webview {
+@@ -63,6 +68,37 @@ bool AwCookieAccessPolicy::GetShouldAcceptThirdPartyCookies(
+   return io_thread_client->ShouldAcceptThirdPartyCookies();
+ }
+ 
++bool AwCookieAccessPolicy::GetShouldAcceptThirdPartyCookies(
++    const net::URLRequest& request) {
++  DCHECK_CURRENTLY_ON(BrowserThread::IO);
++  int child_id = 0;
++  int render_frame_id = 0;
++  int frame_tree_node_id = content::RenderFrameHost::kNoFrameTreeNodeId;
++  ResourceRequestInfo* info = ResourceRequestInfo::ForRequest(&request);
++  if (info) {
++    child_id = info->GetChildID();
++    render_frame_id = info->GetRenderFrameID();
++    frame_tree_node_id = info->GetFrameTreeNodeId();
++  } else {
++    WebSocketHandshakeRequestInfo* websocket_info =
++        WebSocketHandshakeRequestInfo::ForRequest(&request);
++    if (!websocket_info)
++      return false;
++    child_id = websocket_info->GetChildId();
++    render_frame_id = websocket_info->GetRenderFrameId();
++  }
++  return GetShouldAcceptThirdPartyCookies(child_id, render_frame_id,
++                                          frame_tree_node_id);
++}
++
++bool AwCookieAccessPolicy::AllowCookies(const net::URLRequest& request) {
++  DCHECK_CURRENTLY_ON(BrowserThread::IO);
++  DCHECK(!base::FeatureList::IsEnabled(network::features::kNetworkService));
++  bool third_party = GetShouldAcceptThirdPartyCookies(request);
++  return CanAccessCookies(request.url(), request.site_for_cookies(),
++                          third_party);
++}
++
+ bool AwCookieAccessPolicy::AllowCookies(const GURL& url,
+                                         const GURL& first_party,
+                                         int render_process_id,
+diff --git a/chrome/browser/signin/chrome_signin_helper_unittest.cc b/chrome/browser/signin/chrome_signin_helper_unittest.cc
+index 5106024aacc4fef8ad9c1cc18ce114aa3b0d1453..f51b4113923766cb6154e6956496d84820c1057a 100644
+--- a/chrome/browser/signin/chrome_signin_helper_unittest.cc
++++ b/chrome/browser/signin/chrome_signin_helper_unittest.cc
+@@ -12,6 +12,7 @@
+ #include "chrome/browser/signin/scoped_account_consistency.h"
+ #include "components/signin/core/browser/signin_header_helper.h"
+ #include "components/signin/public/base/signin_buildflags.h"
++#include "content/public/browser/resource_request_info.h"
+ #include "content/public/test/test_browser_thread_bundle.h"
+ #include "net/http/http_response_headers.h"
+ #include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
+diff --git a/chromecast/browser/BUILD.gn b/chromecast/browser/BUILD.gn
+index 45ae4458059e19e75ad81ae188ae465212bdddb6..5c1c1170df605934db070be437b645c8a5b8ab45 100644
+--- a/chromecast/browser/BUILD.gn
++++ b/chromecast/browser/BUILD.gn
+@@ -496,6 +496,7 @@ cast_source_set("unittests") {
+     "application_media_info_manager_unittest.cc",
+     "bluetooth/cast_bluetooth_chooser_unittest.cc",
+     "cast_media_blocker_unittest.cc",
++    "cast_network_delegate_unittest.cc",
+     "cast_session_id_map_unittest.cc",
+     "devtools/cast_devtools_manager_delegate_unittest.cc",
+     "lru_renderer_cache_test.cc",
+diff --git a/chromecast/browser/cast_network_delegate.cc b/chromecast/browser/cast_network_delegate.cc
+index e5d2cc1ceae0ca0bed8a55d89f4d1f961886014a..919665110ff0695b635d495582efe8fd1fe28b8a 100644
+--- a/chromecast/browser/cast_network_delegate.cc
++++ b/chromecast/browser/cast_network_delegate.cc
+@@ -11,6 +11,7 @@
+ #include "chromecast/base/chromecast_switches.h"
+ #include "chromecast/browser/cast_navigation_ui_data.h"
+ #include "chromecast/browser/cast_network_request_interceptor.h"
++#include "content/public/browser/resource_request_info.h"
+ #include "content/public/common/child_process_host.h"
+ #include "net/base/net_errors.h"
+ 
+@@ -63,7 +64,32 @@ int CastNetworkDelegate::OnBeforeURLRequest(
+     net::URLRequest* request,
+     net::CompletionOnceCallback callback,
+     GURL* new_url) {
+-  return net::OK;
++  if (!network_request_interceptor_->IsInitialized())
++    return net::OK;
++
++  // Get session id
++  std::string session_id;
++  content::ResourceRequestInfo* request_info =
++      content::ResourceRequestInfo::ForRequest(request);
++  CastNavigationUIData* nav_data =
++      request_info ? static_cast<CastNavigationUIData*>(
++                         request_info->GetNavigationUIData())
++                   : nullptr;
++  if (nav_data) {
++    session_id = nav_data->session_id();
++  }
++
++  // Get render process PID
++  int render_process_id;
++  int render_frame_id;
++  if (!content::ResourceRequestInfo::GetRenderFrameForRequest(
++          request, &render_process_id, &render_frame_id)) {
++    render_process_id = content::ChildProcessHost::kInvalidUniqueID;
++    render_frame_id = content::ChildProcessHost::kInvalidUniqueID;
++  }
++  return network_request_interceptor_->OnBeforeURLRequest(
++      request, session_id, render_process_id, render_frame_id,
++      std::move(callback), new_url);
+ }
+ 
+ int CastNetworkDelegate::OnBeforeStartTransaction(
+diff --git a/chromecast/browser/cast_network_delegate_unittest.cc b/chromecast/browser/cast_network_delegate_unittest.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..bdfdccbc25e1f1552e0020bf2f71000b72fea48a
+--- /dev/null
++++ b/chromecast/browser/cast_network_delegate_unittest.cc
+@@ -0,0 +1,132 @@
++// Copyright 2018 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "chromecast/browser/cast_network_delegate.h"
++
++#include <utility>
++
++#include "base/test/scoped_task_environment.h"
++#include "chromecast/browser/cast_network_request_interceptor.h"
++#include "net/base/request_priority.h"
++#include "net/base/test_completion_callback.h"
++#include "net/traffic_annotation/network_traffic_annotation_test_helper.h"
++#include "net/url_request/url_request_test_util.h"
++#include "testing/gmock/include/gmock/gmock.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++using testing::_;
++using testing::Return;
++
++namespace chromecast {
++namespace shell {
++
++namespace {
++
++class MockCastNetworkRequestInterceptor : public CastNetworkRequestInterceptor {
++ public:
++  MockCastNetworkRequestInterceptor() {}
++  ~MockCastNetworkRequestInterceptor() override {}
++
++  MOCK_CONST_METHOD5(IsWhiteListed,
++                     bool(const GURL& gurl,
++                          const std::string& session_id,
++                          int render_process_id,
++                          int render_frame_id,
++                          bool for_device_auth));
++  MOCK_METHOD0(Initialize, void());
++  MOCK_METHOD0(IsInitialized, bool());
++  MOCK_METHOD6(OnBeforeURLRequest,
++               int(net::URLRequest* request,
++                   const std::string& session_id,
++                   int render_process_id,
++                   int render_frame_id,
++                   net::CompletionOnceCallback callback,
++                   GURL* new_url));
++  MOCK_METHOD3(OnBeforeStartTransaction,
++               int(net::URLRequest* request,
++                   net::CompletionOnceCallback callback,
++                   net::HttpRequestHeaders* headers));
++  MOCK_METHOD1(OnURLRequestDestroyed, void(net::URLRequest* request));
++
++ private:
++  DISALLOW_COPY_AND_ASSIGN(MockCastNetworkRequestInterceptor);
++};
++
++}  // namespace
++
++class CastNetworkDelegateTest : public testing::Test {
++ public:
++  CastNetworkDelegateTest()
++      : task_env_(
++            base::test::ScopedTaskEnvironment::MainThreadType::DEFAULT,
++            base::test::ScopedTaskEnvironment::ThreadPoolExecutionMode::QUEUED),
++        context_(true) {
++    context_.Init();
++    std::unique_ptr<MockCastNetworkRequestInterceptor>
++        cast_network_request_interceptor_ =
++            std::make_unique<MockCastNetworkRequestInterceptor>();
++    cast_network_request_interceptor_ptr_ =
++        cast_network_request_interceptor_.get();
++    cast_network_delegate_ = std::make_unique<CastNetworkDelegate>(
++        std::move(cast_network_request_interceptor_));
++  }
++  ~CastNetworkDelegateTest() override {}
++
++ protected:
++  base::test::ScopedTaskEnvironment task_env_;
++
++  std::unique_ptr<CastNetworkDelegate> cast_network_delegate_;
++  MockCastNetworkRequestInterceptor* cast_network_request_interceptor_ptr_;
++
++  net::TestURLRequestContext context_;
++  net::TestDelegate delegate_;
++};
++
++TEST_F(CastNetworkDelegateTest, NotifyBeforeURLRequest) {
++  std::unique_ptr<net::URLRequest> request = context_.CreateRequest(
++      GURL(), net::IDLE, &delegate_, TRAFFIC_ANNOTATION_FOR_TESTS);
++  net::TestCompletionCallback completion_callback;
++
++  EXPECT_CALL(*cast_network_request_interceptor_ptr_, IsInitialized())
++      .WillOnce(Return(true));
++  EXPECT_CALL(*cast_network_request_interceptor_ptr_,
++              OnBeforeURLRequest(_, _, _, _, _, _));
++
++  cast_network_delegate_->NotifyBeforeURLRequest(
++      request.get(), completion_callback.callback(), NULL);
++  task_env_.RunUntilIdle();
++}
++
++TEST_F(CastNetworkDelegateTest, NotifyBeforeStartTransaction) {
++  std::unique_ptr<net::URLRequest> request = context_.CreateRequest(
++      GURL(), net::IDLE, &delegate_, TRAFFIC_ANNOTATION_FOR_TESTS);
++  net::TestCompletionCallback completion_callback;
++  std::unique_ptr<net::HttpRequestHeaders> request_headers(
++      new net::HttpRequestHeaders());
++
++  EXPECT_CALL(*cast_network_request_interceptor_ptr_, IsInitialized())
++      .WillOnce(Return(true));
++  EXPECT_CALL(*cast_network_request_interceptor_ptr_,
++              OnBeforeStartTransaction(_, _, _));
++
++  cast_network_delegate_->NotifyBeforeStartTransaction(
++      request.get(), completion_callback.callback(), request_headers.get());
++  task_env_.RunUntilIdle();
++}
++
++TEST_F(CastNetworkDelegateTest, NotifyBeforeURLRequestDestroyed) {
++  std::unique_ptr<net::URLRequest> request = context_.CreateRequest(
++      GURL(), net::IDLE, &delegate_, TRAFFIC_ANNOTATION_FOR_TESTS);
++
++  EXPECT_CALL(*cast_network_request_interceptor_ptr_, IsInitialized())
++      .WillOnce(Return(true));
++  EXPECT_CALL(*cast_network_request_interceptor_ptr_,
++              OnURLRequestDestroyed(request.get()));
++
++  cast_network_delegate_->NotifyURLRequestDestroyed(request.get());
++  task_env_.RunUntilIdle();
++}
++
++}  // namespace shell
++}  // namespace chromecast
+diff --git a/chromecast/browser/extensions/cast_extensions_browser_client.cc b/chromecast/browser/extensions/cast_extensions_browser_client.cc
+index 48d9dfaf0c31449e90192f1d2b55a694f4f8ac73..6dca8e423df15f3174c07d418e45f502bc3df586 100644
+--- a/chromecast/browser/extensions/cast_extensions_browser_client.cc
++++ b/chromecast/browser/extensions/cast_extensions_browser_client.cc
+@@ -21,6 +21,7 @@
+ #include "content/public/browser/browser_task_traits.h"
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/resource_request_info.h"
+ #include "content/public/common/user_agent.h"
+ #include "extensions/browser/api/extensions_api_client.h"
+ #include "extensions/browser/api/runtime/runtime_api_delegate.h"
+diff --git a/content/browser/BUILD.gn b/content/browser/BUILD.gn
+index 01dacf7c851ca8e44267f362c71e5c4ef57ee10d..ea47476a7ada2f0b82cac162394413b0574a6d9a 100644
+--- a/content/browser/BUILD.gn
++++ b/content/browser/BUILD.gn
+@@ -1110,6 +1110,10 @@ jumbo_source_set("browser") {
+     "loader/prefetch_url_loader.h",
+     "loader/prefetch_url_loader_service.cc",
+     "loader/prefetch_url_loader_service.h",
++    "loader/resource_request_info_impl.cc",
++    "loader/resource_request_info_impl.h",
++    "loader/resource_requester_info.cc",
++    "loader/resource_requester_info.h",
+     "loader/shared_cors_origin_access_list_impl.cc",
+     "loader/shared_cors_origin_access_list_impl.h",
+     "loader/single_request_url_loader_factory.cc",
+diff --git a/content/browser/download/download_manager_impl.cc b/content/browser/download/download_manager_impl.cc
+index 809d7e961087c4774d86753a3c042bbb9cd5af16..87425732ee968c5a58ebf0f35be9a26bb99df2b4 100644
+--- a/content/browser/download/download_manager_impl.cc
++++ b/content/browser/download/download_manager_impl.cc
+@@ -38,6 +38,7 @@
+ #include "components/download/public/common/input_stream.h"
+ #include "components/download/public/common/url_download_handler_factory.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "content/browser/byte_stream.h"
+ #include "content/browser/child_process_security_policy_impl.h"
+ #include "content/browser/data_url_loader_factory.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+@@ -45,6 +46,7 @@
+ #include "content/browser/download/file_system_download_url_loader_factory_getter.h"
+ #include "content/browser/download/network_download_url_loader_factory_getter.h"
+ #include "content/browser/download/web_ui_download_url_loader_factory_getter.h"
++#include "content/browser/loader/resource_request_info_impl.h"
+ #include "content/browser/renderer_host/render_view_host_impl.h"
+ #include "content/browser/storage_partition_impl.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+diff --git a/content/browser/loader/navigation_url_loader_impl.cc b/content/browser/loader/navigation_url_loader_impl.cc
+index 23a59f0de21d81500dbcddf67be3656ad1a26013..47f5aa3dbed2d7c1416da74895597cc18c659b80 100644
+--- a/content/browser/loader/navigation_url_loader_impl.cc
++++ b/content/browser/loader/navigation_url_loader_impl.cc
+@@ -32,6 +32,7 @@
+ #include "content/browser/loader/navigation_loader_interceptor.h"
+ #include "content/browser/loader/navigation_url_loader_delegate.h"
+ #include "content/browser/loader/prefetch_url_loader_service.h"
++#include "content/browser/loader/resource_request_info_impl.h"
+ #include "content/browser/navigation_subresource_loader_params.h"
+ #include "content/browser/service_worker/service_worker_navigation_handle.h"
+ #include "content/browser/service_worker/service_worker_navigation_handle_core.h"
+diff --git a/content/browser/loader/resource_request_info_impl.cc b/content/browser/loader/resource_request_info_impl.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c4fd01e6bd24147a32ad1ea76ccafcbf3a6cfec
+--- /dev/null
++++ b/content/browser/loader/resource_request_info_impl.cc
+@@ -0,0 +1,360 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/loader/resource_request_info_impl.h"
++
++#include "base/bind.h"
++#include "content/browser/frame_host/frame_tree_node.h"
++#include "content/browser/service_worker/service_worker_provider_host.h"
++#include "content/browser/web_contents/frame_tree_node_id_registry.h"
++#include "content/browser/web_contents/web_contents_impl.h"
++#include "content/common/net/url_request_service_worker_data.h"
++#include "content/common/net/url_request_user_data.h"
++#include "content/public/browser/browser_thread.h"
++#include "content/public/browser/global_request_id.h"
++#include "content/public/browser/global_routing_id.h"
++#include "content/public/common/navigation_policy.h"
++#include "content/public/common/process_type.h"
++#include "net/url_request/url_request.h"
++
++namespace content {
++
++namespace {
++
++int FrameTreeNodeIdFromHostIds(int render_process_host_id,
++                               int render_frame_host_id) {
++  RenderFrameHost* render_frame_host =
++      RenderFrameHost::FromID(render_process_host_id, render_frame_host_id);
++  return render_frame_host ? render_frame_host->GetFrameTreeNodeId() : -1;
++}
++
++// static
++const void* const kResourceRequestInfoImplKey = &kResourceRequestInfoImplKey;
++
++}  // namespace
++
++// ----------------------------------------------------------------------------
++// ResourceRequestInfo
++
++// static
++ResourceRequestInfo* ResourceRequestInfo::ForRequest(
++    const net::URLRequest* request) {
++  return ResourceRequestInfoImpl::ForRequest(request);
++}
++
++// static
++void ResourceRequestInfo::AllocateForTesting(
++    net::URLRequest* request,
++    ResourceType resource_type,
++    ResourceContext* context,
++    int render_process_id,
++    int render_view_id,
++    int render_frame_id,
++    bool is_main_frame,
++    ResourceInterceptPolicy resource_intercept_policy,
++    bool is_async,
++    PreviewsState previews_state,
++    std::unique_ptr<NavigationUIData> navigation_ui_data) {
++  // Make sure ResourceType::kMainFrame is declared as being fetched as part of
++  // the main frame.
++  DCHECK(resource_type != ResourceType::kMainFrame || is_main_frame);
++
++  ResourceRequestInfoImpl* info = new ResourceRequestInfoImpl(
++      ResourceRequesterInfo::CreateForRendererTesting(
++          render_process_id),                    // resource_requester_info
++      render_view_id,                            // route_id
++      -1,                                        // frame_tree_node_id
++      ChildProcessHost::kInvalidUniqueID,        // plugin_child_id
++      0,                                         // request_id
++      render_frame_id,                           // render_frame_id
++      is_main_frame,                             // is_main_frame
++      {},                                        // fetch_window_id
++      resource_type,                             // resource_type
++      ui::PAGE_TRANSITION_LINK,                  // transition_type
++      false,                                     // is_download
++      resource_intercept_policy,                 // resource_intercept_policy
++      false,                                     // has_user_gesture
++      false,                                     // enable load timing
++      request->has_upload(),                     // enable upload progress
++      false,                                     // do_not_prompt_for_login
++      false,                                     // keep_alive
++      network::mojom::ReferrerPolicy::kDefault,  // referrer_policy
++      false,                                     // is_prerendering
++      context,                                   // context
++      false,                                     // report_raw_headers
++      false,                                     // report_security_info
++      is_async,                                  // is_async
++      previews_state,                            // previews_state
++      nullptr,                                   // body
++      false);                                    // initiated_in_secure_context
++  info->AssociateWithRequest(request);
++  info->set_navigation_ui_data(std::move(navigation_ui_data));
++}
++
++// static
++bool ResourceRequestInfo::GetRenderFrameForRequest(
++    const net::URLRequest* request,
++    int* render_process_id,
++    int* render_frame_id) {
++  URLRequestUserData* user_data = static_cast<URLRequestUserData*>(
++      request->GetUserData(URLRequestUserData::kUserDataKey));
++  if (!user_data)
++    return false;
++  *render_process_id = user_data->render_process_id();
++  *render_frame_id = user_data->render_frame_id();
++  return true;
++}
++
++// static
++bool ResourceRequestInfo::OriginatedFromServiceWorker(
++    const net::URLRequest* request) {
++  return !!request->GetUserData(
++      content::URLRequestServiceWorkerData::kUserDataKey);
++}
++
++// ----------------------------------------------------------------------------
++// ResourceRequestInfoImpl
++
++// static
++ResourceRequestInfoImpl* ResourceRequestInfoImpl::ForRequest(
++    const net::URLRequest* request) {
++  return static_cast<ResourceRequestInfoImpl*>(
++      request->GetUserData(kResourceRequestInfoImplKey));
++}
++
++ResourceRequestInfoImpl::ResourceRequestInfoImpl(
++    scoped_refptr<ResourceRequesterInfo> requester_info,
++    int route_id,
++    int frame_tree_node_id,
++    int plugin_child_id,
++    int request_id,
++    int render_frame_id,
++    bool is_main_frame,
++    const base::UnguessableToken& fetch_window_id,
++    ResourceType resource_type,
++    ui::PageTransition transition_type,
++    bool is_download,
++    ResourceInterceptPolicy resource_intercept_policy,
++    bool has_user_gesture,
++    bool enable_load_timing,
++    bool enable_upload_progress,
++    bool do_not_prompt_for_login,
++    bool keepalive,
++    network::mojom::ReferrerPolicy referrer_policy,
++    bool is_prerendering,
++    ResourceContext* context,
++    bool report_raw_headers,
++    bool report_security_info,
++    bool is_async,
++    PreviewsState previews_state,
++    const scoped_refptr<network::ResourceRequestBody> body,
++    bool initiated_in_secure_context)
++    : detachable_handler_(nullptr),
++      requester_info_(std::move(requester_info)),
++      route_id_(route_id),
++      frame_tree_node_id_(frame_tree_node_id),
++      plugin_child_id_(plugin_child_id),
++      request_id_(request_id),
++      render_frame_id_(render_frame_id),
++      is_main_frame_(is_main_frame),
++      fetch_window_id_(fetch_window_id),
++      is_download_(is_download),
++      resource_intercept_policy_(resource_intercept_policy),
++      has_user_gesture_(has_user_gesture),
++      enable_load_timing_(enable_load_timing),
++      enable_upload_progress_(enable_upload_progress),
++      do_not_prompt_for_login_(do_not_prompt_for_login),
++      keepalive_(keepalive),
++      counted_as_in_flight_request_(false),
++      resource_type_(resource_type),
++      transition_type_(transition_type),
++      memory_cost_(0),
++      referrer_policy_(referrer_policy),
++      is_prerendering_(is_prerendering),
++      context_(context),
++      report_raw_headers_(report_raw_headers),
++      report_security_info_(report_security_info),
++      is_async_(is_async),
++      previews_state_(previews_state),
++      body_(body),
++      initiated_in_secure_context_(initiated_in_secure_context),
++      blocked_response_from_reaching_renderer_(false),
++      should_report_corb_blocking_(false),
++      first_auth_attempt_(true) {}
++
++ResourceRequestInfoImpl::~ResourceRequestInfoImpl() {
++}
++
++WebContents::Getter ResourceRequestInfoImpl::GetWebContentsGetterForRequest() {
++  // If we have a window id, try to use that.
++  if (fetch_window_id_) {
++    if (auto getter =
++            FrameTreeNodeIdRegistry::GetInstance()->GetWebContentsGetter(
++                fetch_window_id_)) {
++      return getter;
++    }
++  }
++
++  // Navigation requests are created with a valid FrameTreeNode ID and invalid
++  // RenderProcessHost and RenderFrameHost IDs. The FrameTreeNode ID should be
++  // used to access the WebContents.
++  if (frame_tree_node_id_ != RenderFrameHost::kNoFrameTreeNodeId) {
++    return base::Bind(WebContents::FromFrameTreeNodeId, frame_tree_node_id_);
++  }
++
++  // In other cases, use the RenderProcessHost ID + RenderFrameHost ID to get
++  // the WebContents.
++  int render_process_host_id = -1;
++  int render_frame_host_id = -1;
++  if (!GetAssociatedRenderFrame(&render_process_host_id,
++                                &render_frame_host_id)) {
++    NOTREACHED();
++  }
++
++  return base::Bind(&WebContentsImpl::FromRenderFrameHostID,
++                    render_process_host_id, render_frame_host_id);
++}
++
++ResourceRequestInfo::FrameTreeNodeIdGetter
++ResourceRequestInfoImpl::GetFrameTreeNodeIdGetterForRequest() {
++  if (frame_tree_node_id_ != -1) {
++    return base::Bind([](int id) { return id; }, frame_tree_node_id_);
++  }
++
++  int render_process_host_id = -1;
++  int render_frame_host_id = -1;
++  if (!GetAssociatedRenderFrame(&render_process_host_id,
++                                &render_frame_host_id)) {
++    NOTREACHED();
++  }
++
++  return base::Bind(&FrameTreeNodeIdFromHostIds, render_process_host_id,
++                    render_frame_host_id);
++}
++
++ResourceContext* ResourceRequestInfoImpl::GetContext() {
++  return context_;
++}
++
++int ResourceRequestInfoImpl::GetChildID() {
++  return requester_info_->child_id();
++}
++
++int ResourceRequestInfoImpl::GetRouteID() {
++  return route_id_;
++}
++
++GlobalRequestID ResourceRequestInfoImpl::GetGlobalRequestID() {
++  return GlobalRequestID(GetChildID(), request_id_);
++}
++
++int ResourceRequestInfoImpl::GetPluginChildID() {
++  return plugin_child_id_;
++}
++
++int ResourceRequestInfoImpl::GetRenderFrameID() {
++  return render_frame_id_;
++}
++
++int ResourceRequestInfoImpl::GetFrameTreeNodeId() {
++  return frame_tree_node_id_;
++}
++
++bool ResourceRequestInfoImpl::IsMainFrame() {
++  return is_main_frame_;
++}
++
++ResourceType ResourceRequestInfoImpl::GetResourceType() {
++  return resource_type_;
++}
++
++network::mojom::ReferrerPolicy ResourceRequestInfoImpl::GetReferrerPolicy() {
++  return referrer_policy_;
++}
++
++bool ResourceRequestInfoImpl::IsPrerendering() {
++  return is_prerendering_;
++}
++
++ui::PageTransition ResourceRequestInfoImpl::GetPageTransition() {
++  return transition_type_;
++}
++
++bool ResourceRequestInfoImpl::HasUserGesture() {
++  return has_user_gesture_;
++}
++
++bool ResourceRequestInfoImpl::GetAssociatedRenderFrame(int* render_process_id,
++                                                       int* render_frame_id) {
++  *render_process_id = GetChildID();
++  *render_frame_id = render_frame_id_;
++  return true;
++}
++
++bool ResourceRequestInfoImpl::IsAsync() {
++  return is_async_;
++}
++
++bool ResourceRequestInfoImpl::IsDownload() {
++  return is_download_;
++}
++
++PreviewsState ResourceRequestInfoImpl::GetPreviewsState() {
++  return previews_state_;
++}
++
++NavigationUIData* ResourceRequestInfoImpl::GetNavigationUIData() {
++  return navigation_ui_data_.get();
++}
++
++void ResourceRequestInfoImpl::SetResourceRequestBlockedReason(
++    blink::ResourceRequestBlockedReason reason) {
++  resource_request_blocked_reason_ = reason;
++}
++
++base::Optional<blink::ResourceRequestBlockedReason>
++ResourceRequestInfoImpl::GetResourceRequestBlockedReason() {
++  return resource_request_blocked_reason_;
++}
++
++base::StringPiece ResourceRequestInfoImpl::GetCustomCancelReason() {
++  return custom_cancel_reason_;
++}
++
++void ResourceRequestInfoImpl::AssociateWithRequest(net::URLRequest* request) {
++  request->SetUserData(kResourceRequestInfoImplKey, base::WrapUnique(this));
++  int render_process_id;
++  int render_frame_id;
++  if (GetAssociatedRenderFrame(&render_process_id, &render_frame_id)) {
++    request->SetUserData(URLRequestUserData::kUserDataKey,
++                         std::make_unique<URLRequestUserData>(render_process_id,
++                                                              render_frame_id));
++  }
++}
++
++int ResourceRequestInfoImpl::GetRequestID() const {
++  return request_id_;
++}
++
++GlobalRoutingID ResourceRequestInfoImpl::GetGlobalRoutingID() {
++  return GlobalRoutingID(GetChildID(), route_id_);
++}
++
++bool ResourceRequestInfoImpl::ShouldReportRawHeaders() const {
++  return report_raw_headers_;
++}
++
++bool ResourceRequestInfoImpl::ShouldReportSecurityInfo() const {
++  return report_security_info_;
++}
++
++void ResourceRequestInfoImpl::ResetBody() {
++  body_ = nullptr;
++}
++
++void ResourceRequestInfoImpl::SetBlobHandles(BlobHandles blob_handles) {
++  blob_handles_ = std::move(blob_handles);
++}
++
++}  // namespace content
+diff --git a/content/browser/loader/resource_request_info_impl.h b/content/browser/loader/resource_request_info_impl.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..92985b6c47c1724018ba8a6d09cee407ab422f56
+--- /dev/null
++++ b/content/browser/loader/resource_request_info_impl.h
+@@ -0,0 +1,268 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_LOADER_RESOURCE_REQUEST_INFO_IMPL_H_
++#define CONTENT_BROWSER_LOADER_RESOURCE_REQUEST_INFO_IMPL_H_
++
++#include <memory>
++#include <string>
++#include <utility>
++
++#include "base/callback.h"
++#include "base/gtest_prod_util.h"
++#include "base/macros.h"
++#include "base/memory/ref_counted.h"
++#include "base/optional.h"
++#include "base/supports_user_data.h"
++#include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "content/browser/loader/resource_requester_info.h"
++#include "content/public/browser/resource_request_info.h"
++#include "content/public/common/previews_state.h"
++#include "content/public/common/referrer.h"
++#include "content/public/common/resource_intercept_policy.h"
++#include "content/public/common/resource_type.h"
++#include "net/base/load_states.h"
++#include "services/network/public/cpp/resource_request_body.h"
++#include "services/network/public/mojom/url_loader.mojom.h"
++
++namespace content {
++class DetachableResourceHandler;
++class ResourceContext;
++struct GlobalRequestID;
++struct GlobalRoutingID;
++
++// Holds the data ResourceDispatcherHost associates with each request.
++// Retrieve this data by calling ResourceDispatcherHost::InfoForRequest.
++class ResourceRequestInfoImpl : public ResourceRequestInfo,
++                                public base::SupportsUserData::Data {
++ public:
++  // Returns the ResourceRequestInfoImpl associated with the given URLRequest.
++  CONTENT_EXPORT static ResourceRequestInfoImpl* ForRequest(
++      const net::URLRequest* request);
++
++  CONTENT_EXPORT ResourceRequestInfoImpl(
++      scoped_refptr<ResourceRequesterInfo> requester_info,
++      int route_id,
++      int frame_tree_node_id,
++      int plugin_child_id,
++      int request_id,
++      int render_frame_id,
++      bool is_main_frame,
++      const base::UnguessableToken& fetch_window_id,
++      ResourceType resource_type,
++      ui::PageTransition transition_type,
++      bool is_download,
++      ResourceInterceptPolicy resource_intercept_policy,
++      bool has_user_gesture,
++      bool enable_load_timing,
++      bool enable_upload_progress,
++      bool do_not_prompt_for_login,
++      bool keepalive,
++      network::mojom::ReferrerPolicy referrer_policy,
++      bool is_prerendering,
++      ResourceContext* context,
++      bool report_raw_headers,
++      bool report_security_info,
++      bool is_async,
++      PreviewsState previews_state,
++      const scoped_refptr<network::ResourceRequestBody> body,
++      bool initiated_in_secure_context);
++  ~ResourceRequestInfoImpl() override;
++
++  // ResourceRequestInfo implementation:
++  WebContents::Getter GetWebContentsGetterForRequest() override;
++  FrameTreeNodeIdGetter GetFrameTreeNodeIdGetterForRequest() override;
++  ResourceContext* GetContext() override;
++  int GetChildID() override;
++  int GetRouteID() override;
++  GlobalRequestID GetGlobalRequestID() override;
++  int GetPluginChildID() override;
++  int GetRenderFrameID() override;
++  int GetFrameTreeNodeId() override;
++  bool IsMainFrame() override;
++  ResourceType GetResourceType() override;
++  network::mojom::ReferrerPolicy GetReferrerPolicy() override;
++  bool IsPrerendering() override;
++  ui::PageTransition GetPageTransition() override;
++  bool HasUserGesture() override;
++  bool GetAssociatedRenderFrame(int* render_process_id,
++                                int* render_frame_id) override;
++  bool IsAsync() override;
++  bool IsDownload() override;
++  // Returns a bitmask of potentially several Previews optimizations.
++  PreviewsState GetPreviewsState() override;
++  NavigationUIData* GetNavigationUIData() override;
++  void SetResourceRequestBlockedReason(
++      blink::ResourceRequestBlockedReason reason) override;
++  base::Optional<blink::ResourceRequestBlockedReason>
++  GetResourceRequestBlockedReason() override;
++  base::StringPiece GetCustomCancelReason() override;
++
++  CONTENT_EXPORT void AssociateWithRequest(net::URLRequest* request);
++
++  CONTENT_EXPORT int GetRequestID() const;
++  GlobalRoutingID GetGlobalRoutingID();
++
++  // Returns true if raw response headers (including sensitive data such as
++  // cookies) should be included with the response.
++  bool ShouldReportRawHeaders() const;
++
++  // Returns true if security details (SSL/TLS connection parameters and
++  // certificate chain) should be included with the response.
++  bool ShouldReportSecurityInfo() const;
++
++  // PlzNavigate
++  // The id of the FrameTreeNode that initiated this request (for a navigation
++  // request).
++  int frame_tree_node_id() const { return frame_tree_node_id_; }
++
++  ResourceRequesterInfo* requester_info() const {
++    return requester_info_.get();
++  }
++
++  // DetachableResourceHandler for this request.  May be NULL.
++  DetachableResourceHandler* detachable_handler() const {
++    return detachable_handler_;
++  }
++  void set_detachable_handler(DetachableResourceHandler* h) {
++    detachable_handler_ = h;
++  }
++  bool keepalive() const { return keepalive_; }
++
++  ResourceInterceptPolicy resource_intercept_policy() const {
++    return resource_intercept_policy_;
++  }
++
++  // Whether this is a download.
++  void set_is_download(bool download) { is_download_ = download; }
++
++  // Whether this request has been counted towards the number of in flight
++  // requests, which is only true for requests that require a file descriptor
++  // for their shared memory buffer.
++  bool counted_as_in_flight_request() const {
++    return counted_as_in_flight_request_;
++  }
++  void set_counted_as_in_flight_request(bool was_counted) {
++    counted_as_in_flight_request_ = was_counted;
++  }
++
++  // The approximate in-memory size (bytes) that we credited this request
++  // as consuming in |outstanding_requests_memory_cost_map_|.
++  int memory_cost() const { return memory_cost_; }
++  void set_memory_cost(int cost) { memory_cost_ = cost; }
++
++  bool is_load_timing_enabled() const { return enable_load_timing_; }
++
++  bool is_upload_progress_enabled() const { return enable_upload_progress_; }
++
++  bool do_not_prompt_for_login() const { return do_not_prompt_for_login_; }
++  void set_do_not_prompt_for_login(bool do_not_prompt) {
++    do_not_prompt_for_login_ = do_not_prompt;
++  }
++
++  const scoped_refptr<network::ResourceRequestBody>& body() const {
++    return body_;
++  }
++  void ResetBody();
++
++  bool initiated_in_secure_context() const {
++    return initiated_in_secure_context_;
++  }
++  void set_initiated_in_secure_context_for_testing(bool secure) {
++    initiated_in_secure_context_ = secure;
++  }
++
++  void set_navigation_ui_data(
++      std::unique_ptr<NavigationUIData> navigation_ui_data) {
++    navigation_ui_data_ = std::move(navigation_ui_data);
++  }
++
++  void SetBlobHandles(BlobHandles blob_handles);
++
++  bool blocked_response_from_reaching_renderer() const {
++    return blocked_response_from_reaching_renderer_;
++  }
++  void set_blocked_response_from_reaching_renderer(bool value) {
++    blocked_response_from_reaching_renderer_ = value;
++  }
++  bool should_report_corb_blocking() const {
++    return should_report_corb_blocking_;
++  }
++  void set_should_report_corb_blocking(bool value) {
++    should_report_corb_blocking_ = value;
++  }
++
++  void set_custom_cancel_reason(base::StringPiece reason) {
++    custom_cancel_reason_ = reason.as_string();
++  }
++
++  bool first_auth_attempt() const { return first_auth_attempt_; }
++
++  void set_first_auth_attempt(bool first_auth_attempt) {
++    first_auth_attempt_ = first_auth_attempt;
++  }
++
++  const base::UnguessableToken& fetch_window_id() const {
++    return fetch_window_id_;
++  }
++
++ private:
++  FRIEND_TEST_ALL_PREFIXES(ResourceDispatcherHostTest,
++                           DeletedFilterDetached);
++  FRIEND_TEST_ALL_PREFIXES(ResourceDispatcherHostTest,
++                           DeletedFilterDetachedRedirect);
++  // Non-owning, may be NULL.
++  DetachableResourceHandler* detachable_handler_;
++
++  scoped_refptr<ResourceRequesterInfo> requester_info_;
++  int route_id_;
++  const int frame_tree_node_id_;
++  int plugin_child_id_;
++  int request_id_;
++  int render_frame_id_;
++  bool is_main_frame_;
++  base::UnguessableToken fetch_window_id_;
++  bool is_download_;
++  ResourceInterceptPolicy resource_intercept_policy_;
++  bool has_user_gesture_;
++  bool enable_load_timing_;
++  bool enable_upload_progress_;
++  bool do_not_prompt_for_login_;
++  bool keepalive_;
++  bool counted_as_in_flight_request_;
++  ResourceType resource_type_;
++  ui::PageTransition transition_type_;
++  int memory_cost_;
++  network::mojom::ReferrerPolicy referrer_policy_;
++  bool is_prerendering_;
++  ResourceContext* context_;
++  bool report_raw_headers_;
++  bool report_security_info_;
++  bool is_async_;
++  base::Optional<blink::ResourceRequestBlockedReason>
++      resource_request_blocked_reason_;
++  PreviewsState previews_state_;
++  scoped_refptr<network::ResourceRequestBody> body_;
++  bool initiated_in_secure_context_;
++  std::unique_ptr<NavigationUIData> navigation_ui_data_;
++
++  // Whether response details (response headers, timing information, metadata)
++  // have been blocked from reaching the renderer process (e.g. by Cross-Origin
++  // Read Blocking).
++  bool blocked_response_from_reaching_renderer_;
++
++  bool should_report_corb_blocking_;
++  bool first_auth_attempt_;
++
++  // Keeps upload body blobs alive for the duration of the request.
++  BlobHandles blob_handles_;
++
++  std::string custom_cancel_reason_;
++
++  DISALLOW_COPY_AND_ASSIGN(ResourceRequestInfoImpl);
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_LOADER_RESOURCE_REQUEST_INFO_IMPL_H_
+diff --git a/content/browser/loader/resource_requester_info.cc b/content/browser/loader/resource_requester_info.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc15adac0bb8dd31261cb28b54787be06e57a2f6
+--- /dev/null
++++ b/content/browser/loader/resource_requester_info.cc
+@@ -0,0 +1,101 @@
++// Copyright 2016 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/browser/loader/resource_requester_info.h"
++
++#include <utility>
++
++#include "base/bind.h"
++#include "base/feature_list.h"
++#include "base/logging.h"
++#include "content/browser/appcache/chrome_appcache_service.h"
++#include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "content/browser/web_package/signed_exchange_utils.h"
++#include "content/public/browser/resource_context.h"
++#include "content/public/common/child_process_host.h"
++#include "content/public/common/content_features.h"
++#include "content/public/common/navigation_policy.h"
++#include "net/url_request/url_request_context_getter.h"
++#include "services/network/public/cpp/features.h"
++#include "storage/browser/fileapi/file_system_context.h"
++
++namespace content {
++
++ResourceRequesterInfo::ResourceRequesterInfo(
++    RequesterType type,
++    int child_id,
++    ChromeAppCacheService* appcache_service,
++    ChromeBlobStorageContext* blob_storage_context,
++    storage::FileSystemContext* file_system_context,
++    const GetContextsCallback& get_contexts_callback)
++    : type_(type),
++      child_id_(child_id),
++      appcache_service_(appcache_service),
++      blob_storage_context_(blob_storage_context),
++      file_system_context_(file_system_context),
++      get_contexts_callback_(get_contexts_callback) {}
++
++ResourceRequesterInfo::~ResourceRequesterInfo() {}
++
++void ResourceRequesterInfo::set_filter(
++    base::WeakPtr<ResourceMessageFilter> filter) {
++  DCHECK_EQ(RequesterType::RENDERER, type_);
++  filter_ = filter;
++}
++
++void ResourceRequesterInfo::GetContexts(
++    ResourceType resource_type,
++    ResourceContext** resource_context,
++    net::URLRequestContext** request_context) const {
++  get_contexts_callback_.Run(resource_type, resource_context, request_context);
++}
++
++scoped_refptr<ResourceRequesterInfo> ResourceRequesterInfo::CreateForRenderer(
++    int child_id,
++    ChromeAppCacheService* appcache_service,
++    ChromeBlobStorageContext* blob_storage_context,
++    storage::FileSystemContext* file_system_context,
++    const GetContextsCallback& get_contexts_callback) {
++  return scoped_refptr<ResourceRequesterInfo>(new ResourceRequesterInfo(
++      RequesterType::RENDERER, child_id, appcache_service, blob_storage_context,
++      file_system_context, get_contexts_callback));
++}
++
++scoped_refptr<ResourceRequesterInfo>
++ResourceRequesterInfo::CreateForRendererTesting(int child_id) {
++  return scoped_refptr<ResourceRequesterInfo>(new ResourceRequesterInfo(
++      RequesterType::RENDERER, child_id, nullptr /* appcache_service */,
++      nullptr /* blob_storage_context */, nullptr /* file_system_context */,
++      GetContextsCallback()));
++}
++
++scoped_refptr<ResourceRequesterInfo>
++ResourceRequesterInfo::CreateForBrowserSideNavigation() {
++  return scoped_refptr<ResourceRequesterInfo>(new ResourceRequesterInfo(
++      RequesterType::BROWSER_SIDE_NAVIGATION,
++      ChildProcessHost::kInvalidUniqueID, nullptr /* appcache_service */,
++      nullptr /* blob_storage_context */, nullptr /* file_system_context */,
++      GetContextsCallback()));
++}
++
++scoped_refptr<ResourceRequesterInfo>
++ResourceRequesterInfo::CreateForDownloadOrPageSave(int child_id) {
++  return scoped_refptr<ResourceRequesterInfo>(new ResourceRequesterInfo(
++      RequesterType::DOWNLOAD_OR_PAGE_SAVE, child_id,
++      nullptr /* appcache_service */, nullptr /* blob_storage_context */,
++      nullptr /* file_system_context */, GetContextsCallback()));
++}
++
++scoped_refptr<ResourceRequesterInfo>
++ResourceRequesterInfo::CreateForCertificateFetcherForSignedExchange(
++    const GetContextsCallback& get_contexts_callback) {
++  DCHECK(!base::FeatureList::IsEnabled(network::features::kNetworkService));
++  return scoped_refptr<ResourceRequesterInfo>(new ResourceRequesterInfo(
++      RequesterType::CERTIFICATE_FETCHER_FOR_SIGNED_EXCHANGE,
++      ChildProcessHost::kInvalidUniqueID, nullptr /* appcache_service */,
++      nullptr /* blob_storage_context */, nullptr /* file_system_context */,
++      get_contexts_callback));
++}
++
++}  // namespace content
+diff --git a/content/browser/loader/resource_requester_info.h b/content/browser/loader/resource_requester_info.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7333dad5cb3e73badbc6d98b85ce9dcf3e90bde
+--- /dev/null
++++ b/content/browser/loader/resource_requester_info.h
+@@ -0,0 +1,152 @@
++// Copyright 2016 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_BROWSER_LOADER_RESOURCE_REQUESTER_INFO_H_
++#define CONTENT_BROWSER_LOADER_RESOURCE_REQUESTER_INFO_H_
++
++#include <memory>
++
++#include "base/callback.h"
++#include "base/memory/ref_counted.h"
++#include "base/memory/weak_ptr.h"
++#include "content/common/content_export.h"
++#include "content/public/common/resource_type.h"
++
++namespace net {
++class URLRequestContext;
++}  // namespace net
++
++namespace storage {
++class FileSystemContext;
++}  // namespace storage
++
++namespace content {
++class ChromeAppCacheService;
++class ChromeBlobStorageContext;
++class ResourceContext;
++class ResourceMessageFilter;
++
++// This class represents the type of resource requester.
++// Currently there are four types:
++// - Requesters that request resources from renderer processes.
++// - Requesters that request resources within the browser process for browser
++//   side navigation (aka PlzNavigate).
++// - Requesters that request resources for download or page save.
++// - Requesters that request service worker navigation preload requests.
++class CONTENT_EXPORT ResourceRequesterInfo
++    : public base::RefCountedThreadSafe<ResourceRequesterInfo> {
++ public:
++  typedef base::Callback<void(ResourceType resource_type,
++                              ResourceContext**,
++                              net::URLRequestContext**)>
++      GetContextsCallback;
++
++  // Creates a ResourceRequesterInfo for a requester that requests resources
++  // from the renderer process.
++  static scoped_refptr<ResourceRequesterInfo> CreateForRenderer(
++      int child_id,
++      ChromeAppCacheService* appcache_service,
++      ChromeBlobStorageContext* blob_storage_context,
++      storage::FileSystemContext* file_system_context,
++      const GetContextsCallback& get_contexts_callback);
++
++  // Creates a ResourceRequesterInfo for a requester that requests resources
++  // from the renderer process for testing.
++  static scoped_refptr<ResourceRequesterInfo> CreateForRendererTesting(
++      int child_id);
++
++  // Creates a ResourceRequesterInfo for a requester that requests resources
++  // within the browser process for browser side navigation (aka PlzNavigate).
++  static scoped_refptr<ResourceRequesterInfo> CreateForBrowserSideNavigation();
++
++  // Creates a ResourceRequesterInfo for a requester that requests resources for
++  // download or page save.
++  static scoped_refptr<ResourceRequesterInfo> CreateForDownloadOrPageSave(
++      int child_id);
++
++  // Creates a ResourceRequesterInfo for a requester that requests certificates
++  // for signed exchange.
++  // https://wicg.github.io/webpackage/draft-yasskin-http-origin-signed-responses.html
++  static scoped_refptr<ResourceRequesterInfo>
++  CreateForCertificateFetcherForSignedExchange(
++      const GetContextsCallback& get_contexts_callback);
++
++  bool IsRenderer() const { return type_ == RequesterType::RENDERER; }
++  bool IsBrowserSideNavigation() const {
++    return type_ == RequesterType::BROWSER_SIDE_NAVIGATION;
++  }
++  bool IsCertificateFetcherForSignedExchange() const {
++    return type_ == RequesterType::CERTIFICATE_FETCHER_FOR_SIGNED_EXCHANGE;
++  }
++
++  // Returns the renderer process ID associated with the requester. Returns -1
++  // for browser side navigation requester. Even if the ResourceMessageFilter
++  // has been destroyed, this method of renderer type requester info returns the
++  // valid process ID which was assigned to the renderer process of the filter.
++  int child_id() const { return child_id_; }
++
++  // Sets the ResourceMessageFilter of the renderer type requester info.
++  void set_filter(base::WeakPtr<ResourceMessageFilter> filter);
++
++  // Returns the filter for sending IPC messages to the renderer process. This
++  // may return null if the process exited. This method is available only for
++  // renderer type requester.
++  ResourceMessageFilter* filter() { return filter_.get(); }
++
++  // Returns the ResourceContext and URLRequestContext associated to the
++  // requester. Currently this method is available only for renderer type
++  // requester and service worker navigation preload type.
++  void GetContexts(ResourceType resource_type,
++                   ResourceContext** resource_context,
++                   net::URLRequestContext** request_context) const;
++
++  // Returns the ChromeAppCacheService associated with the requester. Currently
++  // this method is available only for renderer type requester.
++  ChromeAppCacheService* appcache_service() { return appcache_service_.get(); }
++
++  // Returns the ChromeBlobStorageContext associated with the requester.
++  // Currently this method is available only for renderer type requester.
++  ChromeBlobStorageContext* blob_storage_context() {
++    return blob_storage_context_.get();
++  }
++
++  // Returns the FileSystemContext associated with the requester. Currently this
++  // method is available only for renderer type requester.
++  storage::FileSystemContext* file_system_context() {
++    return file_system_context_.get();
++  }
++
++ private:
++  friend class base::RefCountedThreadSafe<ResourceRequesterInfo>;
++
++  enum class RequesterType {
++    RENDERER,
++    BROWSER_SIDE_NAVIGATION,
++    DOWNLOAD_OR_PAGE_SAVE,
++    CERTIFICATE_FETCHER_FOR_SIGNED_EXCHANGE
++  };
++
++  ResourceRequesterInfo(RequesterType type,
++                        int child_id,
++                        ChromeAppCacheService* appcache_service,
++                        ChromeBlobStorageContext* blob_storage_context,
++                        storage::FileSystemContext* file_system_context,
++                        const GetContextsCallback& get_contexts_callback);
++  ~ResourceRequesterInfo();
++
++  const RequesterType type_;
++  // The filter might be deleted if the process exited.
++  base::WeakPtr<ResourceMessageFilter> filter_;
++  const int child_id_;
++  const scoped_refptr<ChromeAppCacheService> appcache_service_;
++  const scoped_refptr<ChromeBlobStorageContext> blob_storage_context_;
++  const scoped_refptr<storage::FileSystemContext> file_system_context_;
++  const GetContextsCallback get_contexts_callback_;
++
++  DISALLOW_COPY_AND_ASSIGN(ResourceRequesterInfo);
++};
++
++}  // namespace content
++
++#endif  // CONTENT_BROWSER_LOADER_RESOURCE_REQUESTER_INFO_H_
+diff --git a/content/browser/resource_context_impl.cc b/content/browser/resource_context_impl.cc
+index f5754561c0dc03df16fab9c42275d2367a911154..edef521bfda91488c444768a0c167bbc5e483bc7 100644
+--- a/content/browser/resource_context_impl.cc
++++ b/content/browser/resource_context_impl.cc
+@@ -9,6 +9,7 @@
+ #include "base/bind.h"
+ #include "base/logging.h"
+ #include "content/browser/blob_storage/chrome_blob_storage_context.h"
++#include "content/browser/loader/resource_request_info_impl.h"
+ #include "content/browser/webui/url_data_manager_backend.h"
+ #include "content/public/browser/browser_context.h"
+ #include "content/public/browser/browser_thread.h"
+diff --git a/content/browser/service_worker/service_worker_fetch_dispatcher.cc b/content/browser/service_worker/service_worker_fetch_dispatcher.cc
+index 455c790fa68ef267ae1b4b0f731417d69eda97b2..4797473786eb9c385c76b98229b068746f53afeb 100644
+--- a/content/browser/service_worker/service_worker_fetch_dispatcher.cc
++++ b/content/browser/service_worker/service_worker_fetch_dispatcher.cc
+@@ -20,6 +20,8 @@
+ #include "content/browser/devtools/service_worker_devtools_manager.h"
+ #include "content/browser/frame_host/frame_tree_node.h"
+ #include "content/browser/loader/navigation_url_loader_impl.h"
++#include "content/browser/loader/resource_request_info_impl.h"
++#include "content/browser/loader/resource_requester_info.h"
+ #include "content/browser/service_worker/embedded_worker_status.h"
+ #include "content/browser/service_worker/service_worker_context_core.h"
+ #include "content/browser/service_worker/service_worker_context_wrapper.h"
+diff --git a/content/browser/ssl/ssl_manager.cc b/content/browser/ssl/ssl_manager.cc
+index ebb63a792704c37de6a980d5abdd7a2a31b55bed..14ea3b21f28f9b99864bc196f5a946a4fa8a93ed 100644
+--- a/content/browser/ssl/ssl_manager.cc
++++ b/content/browser/ssl/ssl_manager.cc
+@@ -16,6 +16,7 @@
+ #include "base/task/post_task.h"
+ #include "content/browser/devtools/devtools_instrumentation.h"
+ #include "content/browser/frame_host/navigation_entry_impl.h"
++#include "content/browser/loader/resource_request_info_impl.h"
+ #include "content/browser/ssl/ssl_error_handler.h"
+ #include "content/browser/web_contents/web_contents_impl.h"
+ #include "content/public/browser/browser_context.h"
+diff --git a/content/browser/storage_partition_impl_map.cc b/content/browser/storage_partition_impl_map.cc
+index b11e9ddef31f58e4a42079af21749eb8f3238d8c..6a858d1e2fd7f85bab5e13b3cc3fa2f6da955112 100644
+--- a/content/browser/storage_partition_impl_map.cc
++++ b/content/browser/storage_partition_impl_map.cc
+@@ -30,6 +30,7 @@
+ #include "content/browser/cookie_store/cookie_store_context.h"
+ #include "content/browser/fileapi/browser_file_system_helper.h"
+ #include "content/browser/loader/prefetch_url_loader_service.h"
++#include "content/browser/loader/resource_request_info_impl.h"
+ #include "content/browser/resource_context_impl.h"
+ #include "content/browser/storage_partition_impl.h"
+ #include "content/browser/webui/url_data_manager_backend.h"
+diff --git a/content/browser/webui/url_data_manager_backend.cc b/content/browser/webui/url_data_manager_backend.cc
+index 5d96fc459a0a81d325bb08d959682fa6397f94e2..a70484d1bcb1a853a6e65bf80802e2a7f07dafd3 100644
+--- a/content/browser/webui/url_data_manager_backend.cc
++++ b/content/browser/webui/url_data_manager_backend.cc
+@@ -31,6 +31,7 @@
+ #include "content/public/browser/browser_thread.h"
+ #include "content/public/browser/content_browser_client.h"
+ #include "content/public/browser/render_process_host.h"
++#include "content/public/browser/resource_request_info.h"
+ #include "content/public/common/url_constants.h"
+ #include "net/base/io_buffer.h"
+ #include "net/base/net_errors.h"
+diff --git a/content/common/BUILD.gn b/content/common/BUILD.gn
+index 53d4fcf257814d7cc5ebacb3fdd9888ee1ea347f..4017537ab4fcbfbfcbc66ef85df5bb533dc88393 100644
+--- a/content/common/BUILD.gn
++++ b/content/common/BUILD.gn
+@@ -191,6 +191,10 @@ source_set("common") {
+     "navigation_params_utils.h",
+     "net/record_load_histograms.cc",
+     "net/record_load_histograms.h",
++    "net/url_request_service_worker_data.cc",
++    "net/url_request_service_worker_data.h",
++    "net/url_request_user_data.cc",
++    "net/url_request_user_data.h",
+     "origin_util.cc",
+     "page_messages.h",
+     "page_state_serialization.cc",
+diff --git a/content/common/net/url_request_service_worker_data.cc b/content/common/net/url_request_service_worker_data.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..ceb6df717f59368c311b4283ee82cb198cd15d7c
+--- /dev/null
++++ b/content/common/net/url_request_service_worker_data.cc
+@@ -0,0 +1,17 @@
++// Copyright 2016 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/common/net/url_request_service_worker_data.h"
++
++namespace content {
++
++URLRequestServiceWorkerData::URLRequestServiceWorkerData() {}
++
++URLRequestServiceWorkerData::~URLRequestServiceWorkerData() {}
++
++// static
++const void* const URLRequestServiceWorkerData::kUserDataKey =
++    &URLRequestServiceWorkerData::kUserDataKey;
++
++}  // namespace content
+diff --git a/content/common/net/url_request_service_worker_data.h b/content/common/net/url_request_service_worker_data.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..6562508bdaefa19cdd5ec8341bcda61b9da47a95
+--- /dev/null
++++ b/content/common/net/url_request_service_worker_data.h
+@@ -0,0 +1,28 @@
++// Copyright 2016 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_COMMON_NET_URL_REQUEST_SERVICE_WORKER_DATA_H_
++#define CONTENT_COMMON_NET_URL_REQUEST_SERVICE_WORKER_DATA_H_
++
++#include "base/supports_user_data.h"
++
++namespace content {
++
++// Used to annotate all URLRequests for which the request originated in the
++// Service Worker and for initial Service Worker script loads.
++// Summarized this includes requests due to:
++//  - fetching Service Worker script itself for installation,
++//  - importing other scripts from within a Service Worker script,
++//  - calling fetch() from within a Service Worker script.
++class URLRequestServiceWorkerData : public base::SupportsUserData::Data {
++ public:
++  URLRequestServiceWorkerData();
++  ~URLRequestServiceWorkerData() override;
++
++  static const void* const kUserDataKey;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_COMMON_NET_URL_REQUEST_SERVICE_WORKER_DATA_H_
+diff --git a/content/common/net/url_request_user_data.cc b/content/common/net/url_request_user_data.cc
+new file mode 100644
+index 0000000000000000000000000000000000000000..5c16655027ae4ef56fcf59f8e02b98d3de6aa5fb
+--- /dev/null
++++ b/content/common/net/url_request_user_data.cc
+@@ -0,0 +1,20 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#include "content/common/net/url_request_user_data.h"
++
++namespace content {
++
++URLRequestUserData::URLRequestUserData(int render_process_id,
++                                       int render_frame_id)
++    : render_process_id_(render_process_id),
++      render_frame_id_(render_frame_id) {}
++
++URLRequestUserData::~URLRequestUserData() {}
++
++// static
++const void* const URLRequestUserData::kUserDataKey =
++    &URLRequestUserData::kUserDataKey;
++
++}  // namespace content
+diff --git a/content/common/net/url_request_user_data.h b/content/common/net/url_request_user_data.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..c679aeea18ecc4963007a5c02fe2d871e60c2170
+--- /dev/null
++++ b/content/common/net/url_request_user_data.h
+@@ -0,0 +1,33 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_COMMON_NET_URL_REQUEST_USER_DATA_H_
++#define CONTENT_COMMON_NET_URL_REQUEST_USER_DATA_H_
++
++#include "base/supports_user_data.h"
++#include "content/common/content_export.h"
++
++namespace content {
++
++// Used to annotate all URLRequests for which the request can be associated
++// with a given RenderFrame.
++class CONTENT_EXPORT URLRequestUserData : public base::SupportsUserData::Data {
++ public:
++  URLRequestUserData(int render_process_id,
++                     int render_frame_id);
++  ~URLRequestUserData() override;
++
++  int render_process_id() const { return render_process_id_; }
++  int render_frame_id() const { return render_frame_id_; }
++
++  static const void* const kUserDataKey;
++
++ private:
++  int render_process_id_;
++  int render_frame_id_;
++};
++
++}  // namespace content
++
++#endif  // CONTENT_COMMON_NET_URL_REQUEST_USER_DATA_H_
+diff --git a/content/public/browser/BUILD.gn b/content/public/browser/BUILD.gn
+index 9f343198bbf5fd9214d98e69011aefee4805280d..8004847c7918b569e09217d9527295e091206223 100644
+--- a/content/public/browser/BUILD.gn
++++ b/content/public/browser/BUILD.gn
+@@ -271,6 +271,7 @@ jumbo_source_set("browser_sources") {
+     "renderer_preferences_util.h",
+     "replaced_navigation_entry_data.h",
+     "resource_context.h",
++    "resource_request_info.h",
+     "restore_type.h",
+     "sandbox_type.h",
+     "save_page_type.h",
+diff --git a/content/public/browser/resource_request_info.h b/content/public/browser/resource_request_info.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..ca70246e0bbf18a74a27b80f6fd05250e8bdba96
+--- /dev/null
++++ b/content/public/browser/resource_request_info.h
+@@ -0,0 +1,191 @@
++// Copyright (c) 2012 The Chromium Authors. All rights reserved.
++// Use of this source code is governed by a BSD-style license that can be
++// found in the LICENSE file.
++
++#ifndef CONTENT_PUBLIC_BROWSER_RESOURCE_REQUEST_INFO_H_
++#define CONTENT_PUBLIC_BROWSER_RESOURCE_REQUEST_INFO_H_
++
++#include "base/callback_forward.h"
++#include "base/strings/string_piece.h"
++#include "content/common/content_export.h"
++#include "content/public/browser/global_request_id.h"
++#include "content/public/browser/navigation_ui_data.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/common/previews_state.h"
++#include "content/public/common/resource_intercept_policy.h"
++#include "content/public/common/resource_type.h"
++#include "services/network/public/mojom/referrer_policy.mojom-forward.h"
++#include "third_party/blink/public/platform/resource_request_blocked_reason.h"
++#include "ui/base/page_transition_types.h"
++
++namespace net {
++class URLRequest;
++}
++
++namespace content {
++class ResourceContext;
++
++// Each URLRequest allocated by the ResourceDispatcherHost has a
++// ResourceRequestInfo instance associated with it.
++class ResourceRequestInfo {
++ public:
++  // Returns the ResourceRequestInfo associated with the given URLRequest.
++  CONTENT_EXPORT static ResourceRequestInfo* ForRequest(
++      const net::URLRequest* request);
++
++  // Allocates a new, dummy ResourceRequestInfo and associates it with the
++  // given URLRequest.
++  //
++  // The RenderView routing ID must correspond to the RenderView of the
++  // RenderFrame, both of which share the same RenderProcess. This may be a
++  // different RenderView than the WebContents' main RenderView. If the
++  // download is not associated with a frame, the IDs can be all -1.
++  //
++  // NOTE: Add more parameters if you need to initialize other fields.
++  CONTENT_EXPORT static void AllocateForTesting(
++      net::URLRequest* request,
++      ResourceType resource_type,
++      ResourceContext* context,
++      int render_process_id,
++      int render_view_id,
++      int render_frame_id,
++      bool is_main_frame,
++      ResourceInterceptPolicy resource_intercept_policy,
++      bool is_async,
++      PreviewsState previews_state,
++      std::unique_ptr<NavigationUIData> navigation_ui_data);
++
++  // Returns the associated RenderFrame for a given process. Returns false, if
++  // there is no associated RenderFrame. This method does not rely on the
++  // request being allocated by the ResourceDispatcherHost, but works for all
++  // URLRequests that are associated with a RenderFrame.
++  CONTENT_EXPORT static bool GetRenderFrameForRequest(
++      const net::URLRequest* request,
++      int* render_process_id,
++      int* render_frame_id);
++
++  // Returns true if the request originated from a Service Worker.
++  CONTENT_EXPORT static bool OriginatedFromServiceWorker(
++      const net::URLRequest* request);
++
++  // A callback that returns a frame tree node id . The callback can always
++  // be used, but it may return -1 if no id is found. The callback should only
++  // run on the UI thread.
++  using FrameTreeNodeIdGetter = base::Callback<int(void)>;
++
++  // Returns a callback that returns a pointer to the WebContents this request
++  // is associated with, or nullptr if it no longer exists or the request is
++  // not associated with a WebContents. The callback should only run on the UI
++  // thread.
++  // Note: Not all resource requests will be owned by a WebContents. For
++  // example, requests made by a ServiceWorker.
++  virtual WebContents::Getter GetWebContentsGetterForRequest() = 0;
++
++  // Returns a callback that returns an int with the frame tree node id
++  //   associated with this request, or -1 if it no longer exists. This
++  //   callback should only be run on the UI thread.
++  // Note: Not all resource requests will be associated with a frame. For
++  // example, requests made by a ServiceWorker.
++  virtual FrameTreeNodeIdGetter GetFrameTreeNodeIdGetterForRequest() = 0;
++
++  // Returns the associated ResourceContext.
++  virtual ResourceContext* GetContext() = 0;
++
++  // The child process unique ID of the requestor.
++  // To get a WebContents, use GetWebContentsGetterForRequest instead.
++  virtual int GetChildID() = 0;
++
++  // The IPC route identifier for this request (this identifies the RenderView
++  // or like-thing in the renderer that the request gets routed to).
++  // To get a WebContents, use GetWebContentsGetterForRequest instead.
++  // Don't use this method for new code, as RenderViews are going away.
++  virtual int GetRouteID() = 0;
++
++  // The globally unique identifier for this request.
++  virtual GlobalRequestID GetGlobalRequestID() = 0;
++
++  // The child process unique ID of the originating process, if the request is
++  // was proxied through a renderer process on behalf of a pepper plugin
++  // process; -1 otherwise.
++  virtual int GetPluginChildID() = 0;
++
++  // Returns the FrameTreeNode ID for this frame. This ID is browser-global and
++  // uniquely identifies a frame that hosts content.
++  // Note: Returns -1 for all requests except PlzNavigate requests.
++  virtual int GetFrameTreeNodeId() = 0;
++
++  // The IPC route identifier of the RenderFrame.
++  // To get a WebContents, use GetWebContentsGetterForRequest instead.
++  // TODO(jam): once all navigation and resource requests are sent between
++  // frames and RenderView/RenderViewHost aren't involved we can remove this and
++  // just use GetRouteID above.
++  virtual int GetRenderFrameID() = 0;
++
++  // True if GetRenderFrameID() represents a main frame in the RenderView.
++  virtual bool IsMainFrame() = 0;
++
++  // Returns the associated resource type.
++  virtual ResourceType GetResourceType() = 0;
++
++  // Returns the associated referrer policy.
++  virtual network::mojom::ReferrerPolicy GetReferrerPolicy() = 0;
++
++  // Returns whether the frame that initiated this request is used for
++  // prerendering.
++  virtual bool IsPrerendering() = 0;
++
++  // Returns the associated page transition type.
++  virtual ui::PageTransition GetPageTransition() = 0;
++
++  // True if the request was initiated by a user action (like a tap to follow
++  // a link).
++  //
++  // Note that a false value does not mean the request was not initiated by a
++  // user gesture. Also note that the fact that a user gesture was active
++  // while the request was created does not imply that the user consciously
++  // wanted this request to happen nor is aware of it.
++  //
++  // DO NOT BASE SECURITY DECISIONS ON THIS FLAG!
++  virtual bool HasUserGesture() = 0;
++
++  // Returns false if there is NOT an associated render frame.
++  virtual bool GetAssociatedRenderFrame(int* render_process_id,
++                                        int* render_frame_id) = 0;
++
++  // Returns true if this is associated with an asynchronous request.
++  virtual bool IsAsync() = 0;
++
++  // Whether this is a download.
++  virtual bool IsDownload() = 0;
++
++  // Returns the current state of Previews.
++  virtual PreviewsState GetPreviewsState() = 0;
++
++  // PlzNavigate
++  // Only used for navigations. Returns opaque data set by the embedder on the
++  // UI thread at the beginning of navigation.
++  virtual NavigationUIData* GetNavigationUIData() = 0;
++
++  // Used to annotate requests blocked using net::ERR_BLOCKED_BY_CLIENT and
++  // net::ERR_BLOCKED_BY_RESPONSE errors, with a ResourceRequestBlockedReason.
++  virtual void SetResourceRequestBlockedReason(
++      blink::ResourceRequestBlockedReason) = 0;
++
++  // Returns the ResourceRequestBlockedReason for this request, else
++  // base::nullopt.
++  virtual base::Optional<blink::ResourceRequestBlockedReason>
++  GetResourceRequestBlockedReason() = 0;
++
++  // When the client of a request decides to cancel it, it may optionally
++  // provide an application-defined description of the canncellation reason.
++  // This method returns the custom reason. If no such reason has been provided,
++  // it returns an empty string.
++  virtual base::StringPiece GetCustomCancelReason() = 0;
++
++ protected:
++  virtual ~ResourceRequestInfo() {}
++};
++
++}  // namespace content
++
++#endif  // CONTENT_PUBLIC_BROWSER_RESOURCE_REQUEST_INFO_H_

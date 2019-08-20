@@ -12,6 +12,7 @@
 #include "base/memory/weak_ptr.h"
 #include "base/sequenced_task_runner_helpers.h"
 #include "base/strings/string16.h"
+#include "content/public/browser/resource_request_info.h"
 #include "content/public/browser/web_contents.h"
 #include "net/base/network_delegate.h"
 
@@ -27,7 +28,8 @@ class LoginHandler : public base::RefCountedThreadSafe<LoginHandler> {
   LoginHandler(net::URLRequest* request,
                const net::AuthChallengeInfo& auth_info,
                net::NetworkDelegate::AuthCallback callback,
-               net::AuthCredentials* credentials);
+               net::AuthCredentials* credentials,
+               content::ResourceRequestInfo* resource_request_info);
 
   // The auth is cancelled, must be called on UI thread.
   void CancelAuth();
