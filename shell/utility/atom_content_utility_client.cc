@@ -20,7 +20,6 @@
 #include "services/service_manager/sandbox/switches.h"
 
 #if BUILDFLAG(ENABLE_PRINTING)
-#include "components/services/pdf_compositor/public/cpp/pdf_compositor_service_factory.h"
 #include "components/services/pdf_compositor/public/mojom/pdf_compositor.mojom.h"
 
 #if defined(OS_WIN)

@@ -14,6 +14,7 @@
 #include "base/callback.h"
 #include "base/synchronization/lock.h"
 #include "base/values.h"
+#include "content/public/common/resource_type.h"
 #include "extensions/common/url_pattern.h"
 #include "net/base/network_delegate.h"
 #include "net/http/http_request_headers.h"
