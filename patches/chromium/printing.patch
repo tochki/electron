@@ -11,7 +11,7 @@ majority of changes originally come from these PRs:
 This patch also fixes callback for manual user cancellation and success.
 
 diff --git a/chrome/browser/printing/print_job_worker.cc b/chrome/browser/printing/print_job_worker.cc
-index 72a0c8cd0f1be0f7713c01ce28323619f09fcc20..b78da10cb607f0f7ce0e97a620908b55f0901c0c 100644
+index 13f9d7af3ae796ecec3a9189aa59f4b20171fd7a..9c35b294340cce070a9f428dac6aa587c93ccc6c 100644
 --- a/chrome/browser/printing/print_job_worker.cc
 +++ b/chrome/browser/printing/print_job_worker.cc
 @@ -21,12 +21,12 @@
@@ -57,7 +57,7 @@ index 72a0c8cd0f1be0f7713c01ce28323619f09fcc20..b78da10cb607f0f7ce0e97a620908b55
 +                    JobEventDetails::USER_INIT_CANCELED, 0,
 +                    base::RetainedRef(document_)));
 +  }
-   std::move(callback).Run(printing_context_->settings(), result);
+   std::move(callback).Run(printing_context_->TakeAndResetSettings(), result);
  }
  
 diff --git a/chrome/browser/printing/print_view_manager_base.cc b/chrome/browser/printing/print_view_manager_base.cc
@@ -605,23 +605,28 @@ index 17c363ff9aa2e2262cacd0c9baea3820334bf67b..5b02461c2e9afe254405ddacd904e4bd
    settings->set_color(static_cast<ColorModel>(color.value()));
    settings->set_scale_factor(static_cast<double>(scale_factor.value()) / 100.0);
 diff --git a/printing/printing_context.cc b/printing/printing_context.cc
-index 78e3c3b2e1bea0f3626838eab14267847a556470..b1c16e6eb1d0d9c0a8b700d9faf408d602f962ea 100644
+index cd5c27c87df175676504a06b4e1904f6b836dc90..bf02d746ae72e3774ca125706167316cac2eac0f 100644
 --- a/printing/printing_context.cc
 +++ b/printing/printing_context.cc
-@@ -77,8 +77,6 @@ PrintingContext::Result PrintingContext::UsePdfSettings() {
+@@ -93,9 +93,13 @@ PrintingContext::Result PrintingContext::UsePdfSettings() {
  
  PrintingContext::Result PrintingContext::UpdatePrintSettings(
      base::Value job_settings) {
--  ResetSettings();
--
-   if (!PrintSettingsFromJobSettings(job_settings, &settings_)) {
++<<<<<<< HEAD
+   ResetSettings();
+ 
+   if (!PrintSettingsFromJobSettings(job_settings, settings_.get())) {
++=======
++  if (!PrintSettingsFromJobSettings(job_settings, &settings_)) {
++>>>>>>> fix: printing
      NOTREACHED();
      return OnError();
+   }
 diff --git a/printing/printing_context.h b/printing/printing_context.h
-index 9ccc1a6680bcedd452cade7f7531924ace7876cf..4e1c330c01a1d6d1ba702337f16d8f8a70cd76f5 100644
+index 6a5a7c90ef5ba82837095c7bb934881b108797f7..a033c58076ff229ae45ed7c454fc60a57e5707b7 100644
 --- a/printing/printing_context.h
 +++ b/printing/printing_context.h
-@@ -129,12 +129,12 @@ class PRINTING_EXPORT PrintingContext {
+@@ -131,12 +131,12 @@ class PRINTING_EXPORT PrintingContext {
  
    int job_id() const { return job_id_; }
  
