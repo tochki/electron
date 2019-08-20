@@ -605,23 +605,17 @@ index 17c363ff9aa2e2262cacd0c9baea3820334bf67b..5b02461c2e9afe254405ddacd904e4bd
    settings->set_color(static_cast<ColorModel>(color.value()));
    settings->set_scale_factor(static_cast<double>(scale_factor.value()) / 100.0);
 diff --git a/printing/printing_context.cc b/printing/printing_context.cc
-index cd5c27c87df175676504a06b4e1904f6b836dc90..bf02d746ae72e3774ca125706167316cac2eac0f 100644
+index cd5c27c87df175676504a06b4e1904f6b836dc90..2964555d0230d51ae499cd3ef745e009c3b08aa4 100644
 --- a/printing/printing_context.cc
 +++ b/printing/printing_context.cc
-@@ -93,9 +93,13 @@ PrintingContext::Result PrintingContext::UsePdfSettings() {
+@@ -93,7 +93,6 @@ PrintingContext::Result PrintingContext::UsePdfSettings() {
  
  PrintingContext::Result PrintingContext::UpdatePrintSettings(
      base::Value job_settings) {
-+<<<<<<< HEAD
-   ResetSettings();
+-  ResetSettings();
  
    if (!PrintSettingsFromJobSettings(job_settings, settings_.get())) {
-+=======
-+  if (!PrintSettingsFromJobSettings(job_settings, &settings_)) {
-+>>>>>>> fix: printing
      NOTREACHED();
-     return OnError();
-   }
 diff --git a/printing/printing_context.h b/printing/printing_context.h
 index 6a5a7c90ef5ba82837095c7bb934881b108797f7..a033c58076ff229ae45ed7c454fc60a57e5707b7 100644
 --- a/printing/printing_context.h
