@@ -76,3 +76,4 @@ disable_color_correct_rendering.patch
 add_contentgpuclient_precreatemessageloop_callback.patch
 fix_vc_incompatible_inline_calls.patch
 revert_remove_resourcerequestinfo.patch
+allow_setting_user_agent_on_network_context.patch
