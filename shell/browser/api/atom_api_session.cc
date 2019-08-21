@@ -18,6 +18,7 @@
 #include "chrome/browser/browser_process.h"
 #include "chrome/common/pref_names.h"
 #include "components/download/public/common/download_danger_type.h"
+#include "components/download/public/common/download_url_parameters.h"
 #include "components/prefs/pref_service.h"
 #include "components/prefs/value_map_pref_store.h"
 #include "components/proxy_config/proxy_config_dictionary.h"
@@ -506,6 +507,14 @@ v8::Local<v8::Promise> Session::GetBlobData(v8::Isolate* isolate,
   return handle;
 }
 
+void Session::DownloadURL(const GURL& url) {
+  auto* download_manager =
+      content::BrowserContext::GetDownloadManager(browser_context());
+  auto download_params = std::make_unique<download::DownloadUrlParameters>(
+      url, MISSING_TRAFFIC_ANNOTATION);
+  download_manager->DownloadUrl(std::move(download_params));
+}
+
 void Session::CreateInterruptedDownload(const mate::Dictionary& options) {
   int64_t offset = 0, length = 0;
   double start_time = 0.0;
@@ -654,6 +663,7 @@ void Session::BuildPrototype(v8::Isolate* isolate,
       .SetMethod("setUserAgent", &Session::SetUserAgent)
       .SetMethod("getUserAgent", &Session::GetUserAgent)
       .SetMethod("getBlobData", &Session::GetBlobData)
+      .SetMethod("downloadURL", &Session::DownloadURL)
       .SetMethod("createInterruptedDownload",
                  &Session::CreateInterruptedDownload)
       .SetMethod("setPreloads", &Session::SetPreloads)

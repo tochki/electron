@@ -386,6 +386,14 @@ Returns `String` - The user agent for this session.
 
 Returns `Promise<Buffer>` - resolves with blob data.
 
+#### `ses.downloadURL(url)`
+
+* `url` String
+
+Initiates a download of the resource at `url`.
+The API will generate a [DownloadItem](download-item.md) that can be accessed
+with the [will-download](#event-will-download) event.
+
 #### `ses.createInterruptedDownload(options)`
 
 * `options` Object
