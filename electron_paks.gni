@@ -19,6 +19,7 @@ template("electron_repack_percent") {
     sources = [
       "$root_gen_dir/components/components_resources_${percent}_percent.pak",
       "$root_gen_dir/content/app/resources/content_resources_${percent}_percent.pak",
+      "$root_gen_dir/third_party/blink/public/resources/blink_image_resources_${percent}_percent.pak",
       "$root_gen_dir/third_party/blink/public/resources/blink_scaled_resources_${percent}_percent.pak",
       "$root_gen_dir/ui/resources/ui_resources_${percent}_percent.pak",
     ]
