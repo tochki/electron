@@ -27,6 +27,7 @@ template("electron_repack_percent") {
     deps = [
       "//components/resources",
       "//content/app/resources",
+      "//third_party/blink/public:image_resources_grit",
       "//third_party/blink/public:scaled_resources_${percent}_percent",
       "//ui/resources",
     ]
